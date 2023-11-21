@@ -26,7 +26,7 @@ shellescape==3.8.1
 six==1.16.0
 slowapi==0.1.6
 sse-starlette==0.6.2
-starlette==0.19.1
+starlette==0.32.0
 tomli==2.0.1
 typing-extensions==3.10.0.0
 urllib3==1.26.6
