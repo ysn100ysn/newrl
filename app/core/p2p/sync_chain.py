@@ -19,12 +19,13 @@ from app.core.consensus.minermanager import am_i_in_block_committee, am_i_in_cur
 from app.core.p2p.outgoing import broadcast_receipt, broadcast_block
 from app.core.consensus.receiptmanager import check_receipt_exists_in_db, validate_receipt
 # from app.codes.utils import store_block_proposal
-from app.config.constants import COMMITTEE_SIZE, MINIMUM_ACCEPTANCE_VOTES, NETWORK_TRUSTED_ARCHIVE_NODES, NEWRL_PORT, REQUEST_TIMEOUT, NEWRL_DB
+from app.config.constants import COMMITTEE_SIZE, MINIMUM_ACCEPTANCE_VOTES, NETWORK_SNAPSHOT, NETWORK_TRUSTED_ARCHIVE_NODES, NEWRL_PORT, REQUEST_TIMEOUT, NEWRL_DB, SNAPSHOT_BLOCKS
+
 from app.core.p2p.peers import get_peers
 
 from app.core.blockchain.validator import validate_block, validate_block_data
 from app.core.clock.timers import TIMERS
-from app.core.fs.temp_manager import append_receipt_to_block_in_storage, check_receipt_exists_in_temp, get_blocks_for_index_from_storage, store_block_to_temp, store_receipt_to_temp
+from app.core.fs.temp_manager import append_receipt_to_block, append_receipt_to_block_in_storage, check_receipt_exists_in_temp, get_blocks_for_index_from_storage, store_block_to_temp, store_receipt_to_temp
 from app.core.consensus.consensus import get_committee_consensus, validate_empty_block, validate_block_miner_committee, generate_block_receipt, \
     add_my_receipt_to_block, validate_receipt_for_committee
 from app.migrations.init_db import revert_chain, revert_chain_quick
@@ -140,13 +141,16 @@ def receive_block(block):
         store_block_to_temp(block)
         if am_i_in_current_committee():
             if validate_block(block):
-                my_receipt = add_my_receipt_to_block(block, vote=BLOCK_VOTE_VALID)
+                # Block might be mutated post validate_block call/accept_block call. Hence using original_block
+                my_receipt = add_my_receipt_to_block(original_block, vote=BLOCK_VOTE_VALID)
                 if my_receipt:
-                    consensus_adding_my_receipt = get_committee_consensus(block)
+                    consensus_adding_my_receipt = get_committee_consensus(original_block)
                     if consensus_adding_my_receipt == BLOCK_CONSENSUS_VALID:
-                        logger.info('Block satisfies valid consensus after adding my receipt. Accepting and broadcasting.')
-                        if accept_block(original_block, block['hash']):
-                            broadcast_block(original_block)
+                        logger.info('Block satisfies valid consensus after adding my receipt. Broadcasting to network.')
+                        # if accept_block(consensus_achieved_block, block['hash']):
+                        # get_committee_consensus will add the current node's receipt to the block
+                        # Broadcasting consensus achieved block
+                        broadcast_block(original_block)
                     elif consensus_adding_my_receipt == BLOCK_CONSENSUS_NA:
                         committee = get_committee_for_current_block()
                         broadcast_receipt(my_receipt, nodes=committee)
@@ -197,7 +201,7 @@ def sync_chain_from_node(url, block_index=None):
         logger.info('I am in sync with the node. Aborting sync.')
         return True
 
-    if my_last_block < their_last_block_index - 1000 or my_last_block == 0:
+    if my_last_block < their_last_block_index - SNAPSHOT_BLOCKS or my_last_block == 0:
         quick_sync(url + '/get-newrl-db')
         return True
     block_idx = my_last_block + 1
@@ -262,18 +266,18 @@ def sync_chain_from_peers(force_sync=False):
             logger.info(f'Syncing from peer {url}')
             sync_success = sync_chain_from_node(url, block_index)
             # sync_success can be True, False or None(indeterminate)
-            if sync_success == False:
-                forking_block = find_forking_block(url)
-                if forking_block is None:
-                    logger.info('Chains are not forking')
-                else:
-                    logger.info(f'Chains forking from block {forking_block}. Need to revert.')
-                    snapshot_last_block = get_snapshot_last_block_index()
-                    logger.info('Last snapshot block is %s and forking from %s.', snapshot_last_block, forking_block)
-                    if snapshot_last_block is not None and snapshot_last_block < forking_block:
-                        revert_chain_quick(revert_to_snapshot=True)
-                    else:
-                        revert_chain_quick(revert_to_snapshot=False)
+            # if sync_success == False:
+            #     forking_block = find_forking_block(url)
+            #     if forking_block is None:
+            #         logger.info('Chains are not forking')
+            #     else:
+            #         logger.info(f'Chains forking from block {forking_block}. Need to revert.')
+            #         snapshot_last_block = get_snapshot_last_block_index()
+            #         logger.info('Last snapshot block is %s and forking from %s.', snapshot_last_block, forking_block)
+            #         if snapshot_last_block is not None and snapshot_last_block < forking_block:
+            #             revert_chain_quick(revert_to_snapshot=True)
+            #         else:
+            #             revert_chain_quick(revert_to_snapshot=False)
 
         else:
             logger.info('No node available to sync')
@@ -572,6 +576,10 @@ def find_forking_block(node_url):
 
 def quick_sync(db_url):
     """Copies the entire newrl.db from a peer. Unsecured."""
+    logger.info("Syncing using quick-sync")
+    if NETWORK_SNAPSHOT:
+        logger.info("Using trusted NETWORK_SNAPSHOT")
+        db_url = NETWORK_SNAPSHOT
     downloaded_db_path = NEWRL_DB + ".DOWNLOADED"
     subprocess.call(["curl", "-o", downloaded_db_path, db_url])
     try:
@@ -583,7 +591,6 @@ def quick_sync(db_url):
     except Exception as e:
         logger.info('Could not parse the downloaded DB' + str(e))
         return False
-
     try:
         con = sqlite3.connect(NEWRL_DB)
         cur = con.cursor()
@@ -593,7 +600,9 @@ def quick_sync(db_url):
 
         # Only copy if the downloaded db has more blocks than local
         if blocks[0] > existing_block[0]:
-            subprocess.call(["mv", downloaded_db_path, NEWRL_DB])
+            snapshot_file = NEWRL_DB + '.snapshot'
+            subprocess.call(["mv", downloaded_db_path, snapshot_file])
+            subprocess.call(["cp", snapshot_file, NEWRL_DB])
     except Exception as e:
         logger.info('Removing local db and using downloaded db')
         subprocess.call(["mv", downloaded_db_path, NEWRL_DB])
